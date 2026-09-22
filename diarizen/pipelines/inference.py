@@ -17,6 +17,7 @@ from scipy.ndimage import median_filter
 from huggingface_hub import snapshot_download, hf_hub_download
 from diarizen_pyannote.audio.pipelines import SpeakerDiarization as SpeakerDiarizationPipeline
 from diarizen_pyannote.audio.utils.signal import Binarize
+from pyannote.core import Annotation, Segment
 from pyannote.database.protocol.protocol import ProtocolFile
 
 from diarizen.pipelines.utils import scp2path
@@ -124,6 +125,14 @@ class DiariZenPipeline(SpeakerDiarizationPipeline):
         print('Extracting segmentations.')
         waveform, sample_rate = torchaudio.load(in_wav) 
         waveform = torch.unsqueeze(waveform[0], 0)      # force to use the SDM data
+        n = waveform.shape[-1]
+        original_duration = n / sample_rate
+        # Tile to at least two segmentation windows so VBx clustering has enough
+        # embeddings; a single window still collapses on short clips (~5s).
+        min_n = int(2 * self._segmentation.duration * sample_rate)
+        if 0 < n < min_n:
+            waveform = waveform.repeat(1, -(-min_n // n))
+            waveform = waveform[..., :min_n]
         segmentations = self.get_segmentations({"waveform": waveform, "sample_rate": sample_rate}, soft=False)
 
         if self.apply_median_filtering:
@@ -166,11 +175,16 @@ class DiariZenPipeline(SpeakerDiarizationPipeline):
 
         # reconstruct discrete diarization from raw hard clusters
         hard_clusters[inactive_speakers] = -2
-        discrete_diarization, _ = self.reconstruct(
-            segmentations,
-            hard_clusters,
-            count,
-        )
+        try:
+            discrete_diarization, _ = self.reconstruct(
+                segmentations,
+                hard_clusters,
+                count,
+            )
+        except ValueError as e:
+            result = Annotation(uri=sess_name)
+            result = result.crop(Segment(0, original_duration), mode="intersection")
+            return result
 
         # convert to annotation
         to_annotation = Binarize(
@@ -181,6 +195,7 @@ class DiariZenPipeline(SpeakerDiarizationPipeline):
         )
         result = to_annotation(discrete_diarization)
         result.uri = sess_name
+        result = result.crop(Segment(0, original_duration), mode="intersection")
         
         if self.rttm_out_dir is not None:
             assert sess_name is not None
